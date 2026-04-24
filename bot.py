@@ -1,7 +1,6 @@
 import logging
 from datetime import datetime
 import pytz
-import json
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -9,34 +8,22 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Импорт конфигурации
+# Импорт конфигурации и функций хранения
 from config import BOT_TOKEN
-
-# Путь к файлу с напоминаниями
-REMINDERS_FILE = 'data/reminders.json'
-
-# Загрузка напоминаний из файла
-def load_reminders():
-    try:
-        with open(REMINDERS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-# Сохранение напоминаний в файл
-def save_reminders(reminders):
-    with open(REMINDERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(reminders, f, ensure_ascii=False, indent=4)
-
-# Инициализация хранилища напоминаний
-reminders = load_reminders()
+from storage import (
+    get_user_data,
+    set_user_timezone,
+    add_reminder,
+    get_user_reminders,
+    delete_reminder_by_id,
+    clear_all_reminders
+)
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if user_id not in reminders:
-        reminders[user_id] = {'timezone': None, 'reminders': []}
-        save_reminders(reminders)
+    if user_id not in get_user_data(user_id):
+        get_user_data(user_id)  # Инициализация данных пользователя
     await update.message.reply_text(
         "Привет! Я бот-напоминатель.\n\n"
         "Доступные команды:\n"
@@ -59,14 +46,11 @@ async def handle_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timezone_str = update.message.text
     try:
         pytz.timezone(timezone_str)
-        if user_id in reminders:
-            reminders[user_id]['timezone'] = timezone_str
-            save_reminders(reminders)
-            await update.message.reply_text(f"Часовой пояс установлен: {timezone_str}")
-        else:
-            await update.message.reply_text("Сначала используйте /start")
+        set_user_timezone(user_id, timezone_str)
+        await update.message.reply_text(f"Часовой пояс установлен: {timezone_str}")
     except pytz.UnknownTimeZoneError:
         await update.message.reply_text("Неизвестный часовой пояс. Попробуйте ещё раз.")
+
 
 # Добавление напоминания
 async def add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,39 +75,21 @@ async def handle_reminder_text(update: Update, context: ContextTypes.DEFAULT_TYP
         user_id = str(update.effective_user.id)
         time_str = context.user_data['reminder_time']
 
-        # Получаем часовой пояс пользователя
-        user_timezone = reminders.get(user_id, {}).get('timezone', 'UTC')
-        tz = pytz.timezone(user_timezone)
-
-        # Формируем дату напоминания (сегодня + указанное время)
-        now = datetime.now(tz)
-        reminder_datetime = now.replace(hour=int(time_str.split(':')[0]),
-                                     minute=int(time_str.split(':')[1]),
-                                     second=0, microsecond=0)
-
-        # Если время уже прошло, ставим на следующий день
-        if reminder_datetime <= now:
-            reminder_datetime += timedelta(days=1)
-
-        # Сохраняем напоминание
-        reminder = {
-            'id': len(reminders[user_id]['reminders']) + 1,
-            'time': reminder_datetime.isoformat(),
-            'text': text
-        }
-        reminders[user_id]['reminders'].append(reminder)
-        save_reminders(reminders)
+        # Сохраняем напоминание (ежедневное)
+        reminder_id = add_reminder(user_id, time_str, text)
 
         context.user_data.clear()
-        await update.message.reply_text(f"Напоминание установлено на {reminder_datetime.strftime('%d.%m.%Y %H:%M')}.")
+        await update.message.reply_text(f"Напоминание установлено на {time_str} каждый день.")
 
 # Список напоминаний
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    user_reminders = reminders.get(user_id, {}).get('reminders', [])
+    user_reminders = get_user_reminders(user_id)
+
     if not user_reminders:
         await update.message.reply_text("У вас нет активных напоминаний.")
         return
+
     response = "Ваши напоминания:\n"
     for r in user_reminders:
         response += f"{r['id']}. {r['text']} в {r['time']}\n"
@@ -139,12 +105,44 @@ async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             reminder_id = int(update.message.text)
             user_id = str(update.effective_user.id)
-            user_reminders = reminders.get(user_id, {}).get('reminders', [])
-            for i, r in enumerate(user_reminders):
-                if r['id'] == reminder_id:
-                    del user_reminders[i]
-                    save_reminders(reminders)
-                    await update.message.reply_text(f"Напоминание {reminder_id} удалено.")
-                    break
+            success = delete_reminder_by_id(user_id, reminder_id)
+
+            if success:
+                await update.message.reply_text(f"Напоминание {reminder_id} удалено.")
             else:
-                await update.message.reply_
+                await update.message.reply_text("Напоминание с таким ID не найдено.")
+        except ValueError:
+            await update.message.reply_text("Пожалуйста, введите корректный ID (число).")
+        finally:
+            context.user_data['awaiting_delete'] = False
+
+# Очистка всех напоминаний
+async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    clear_all_reminders(user_id)
+    await update.message.reply_text("Все напоминания удалены.")
+
+# Основная функция запуска бота
+def main():
+    # Создаём приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("set_timezone", set_timezone))
+    application.add_handler(CommandHandler("add_reminder", add_reminder))
+    application.add_handler(CommandHandler("list_reminders", list_reminders))
+    application.add_handler(CommandHandler("delete_reminder", delete_reminder))
+    application.add_handler(CommandHandler("clear_all", clear_all))
+
+    # Обработчики текстовых сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_timezone))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reminder_time))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reminder_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delete))
+
+    # Запускаем бота
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
