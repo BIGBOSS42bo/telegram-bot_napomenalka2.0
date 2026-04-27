@@ -58,8 +58,8 @@ def help_command(update: Update, context: CallbackContext):
 *Доступные команды:*
 /start - Начать диалог
 /help - Показать это сообщение
-/list - Показать список ваших напоминаний
-/del [номер] - Удалить напоминание по номеру (номер можно увидеть в /list)
+/list - Показать список ваших напоминаний (с ID для удаления)
+/del [ID] - Удалить напоминание по ID
 /delall - Удалить все ваши напоминания
 
 *Формат создания напоминания (просто напишите в чат):*
@@ -70,6 +70,7 @@ def help_command(update: Update, context: CallbackContext):
 `Купить хлеб, 10:00, 1:00, inf`
 """
     update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
 
 def add_reminder(update: Update, context: CallbackContext):
     user_id = update.message.chat_id
@@ -87,72 +88,84 @@ def add_reminder(update: Update, context: CallbackContext):
         )
         return
 
-    msg, first_time, interval, count = parsed
+    msg, first_time_str, interval_str, count_str = parsed
 
-    if not validate_time(first_time) or (interval != '0' and not validate_time(interval)):
+    # Валидация времени
+    if not validate_time(first_time_str) or (interval_str != '0' and not validate_time(interval_str)):
         update.message.reply_text("❌ Ошибка в формате времени. Используйте ЧЧ:ММ.")
         return
 
-    if count != 'inf':
+    # Валидация количества повторов
+    if count_str != 'inf':
         try:
-            count = int(count)
+            count = int(count_str)
             if count < 1:
                 raise ValueError
         except ValueError:
             update.message.reply_text("❌ Количество повторов должно быть целым числом > 0 или 'inf'.")
             return
 
-    # Планируем первое напоминание на сегодня или завтра
-    now = datetime.datetime.now()
-    first_target_dt = now.replace(hour=int(first_time[:2]), minute=int(first_time[3:]), second=0, microsecond=0)
-    if first_target_dt < now:
+    # --- КОРРЕКТНОЕ ПЛАНИРОВАНИЕ ПЕРВОГО НАПОМИНАНИЯ ---
+    now = datetime.datetime.now(datetime.timezone.utc) # Используем UTC для стабильности на серверах
+
+    # Парсим целевое время и создаем datetime на сегодня
+    h_first, m_first = map(int, first_time_str.split(':'))
+    first_target_dt = now.replace(hour=h_first, minute=m_first, second=0, microsecond=0)
+    
+    # Если время уже прошло сегодня - ставим на завтра
+    if first_target_dt <= now:
         first_target_dt += datetime.timedelta(days=1)
     
-    first_delta = (first_target_dt - now).total_seconds()
+    # Преобразуем count в нужный тип для передачи в функцию
+    count = count_str if count_str == 'inf' else int(count_str)
+    
+    # Парсим интервал в секунды (для точности вычислений)
+    if interval_str == '0':
+        interval_seconds = 0
+    else:
+        h_int, m_int = map(int, interval_str.split(':'))
+        interval_seconds = h_int * 3600 + m_int * 60
 
-    def send_and_schedule_inner(user_id_inner, msg_inner, interval_inner, count_inner, prev_job_id=None):
+    def send_and_schedule(user_id_inner, msg_inner, interval_sec_inner, count_inner, prev_job_id=None):
         """
-        Внутренняя функция. Отправляет сообщение и планирует следующее.
+        Функция отправки и планирования следующего шага.
         Принимает prev_job_id для удаления предыдущей записи из словаря.
         """
-        # Отправляем сообщение пользователю
+        # 1. ОТПРАВКА СООБЩЕНИЯ (ГЛАВНОЕ ИСПРАВЛЕНИЕ)
         try:
             context.bot.send_message(chat_id=user_id_inner, text=msg_inner)
+            logger.info(f"Отправлено напоминание пользователю {user_id_inner}: {msg_inner}")
         except Exception as e:
             logger.error(f"Ошибка отправки сообщения пользователю {user_id_inner}: {e}")
-            return
+            return # Если не удалось отправить - прекращаем цепочку
 
-        # Логика повтора
-        if interval_inner == '0' or count_inner == 0 or count_inner == 'inf' and False:
-            return
-
-        # Уменьшаем счетчик повторов, если он не бесконечный
-        next_count = count_inner if count_inner == 'inf' else int(count_inner) - 1
-
-        # Если счетчик стал 0 (или был 1), выходим
-        if next_count == 0:
-            # Удаляем запись о предыдущем джобе из словаря пользователя
-            if user_id_inner in user_reminders and prev_job_id in user_reminders[user_id_inner]:
-                del user_reminders[user_id_inner][prev_job_id]
-                if not user_reminders[user_id_inner]: # Если список пуст, удаляем пользователя из словаря
-                    del user_reminders[user_id_inner]
-            return
-
-        # Планируем следующее напоминание ОТ ВРЕМЕНИ ТЕКУЩЕГО СРАБАТЫВАНИЯ (это важно!)
-        h_int, m_int = map(int, interval_inner.split(':'))
+        # 2. ЛОГИКА ПОВТОРА И ПЛАНИРОВАНИЯ СЛЕДУЮЩЕГО ШАГА
         
-        # Используем run_date относительно текущего момента выполнения функции + интервал.
-        # Это гарантирует точность повтора.
-        next_dt = datetime.datetime.now() + datetime.timedelta(hours=h_int, minutes=m_int)
+        # Если интервал 0 или счетчик исчерпан - выходим
+        if interval_sec_inner == 0:
+            return
+
+        if count_inner != 'inf':
+            next_count = int(count_inner) - 1
+            if next_count <= 0:
+                return
+        else:
+            next_count = 'inf'
         
+        # --- КОРРЕКТНОЕ ВЫЧИСЛЕНИЕ ВРЕМЕНИ СЛЕДУЮЩЕГО НАПОМИНАНИЯ ---
+        # Следующее напоминание должно прийти через `interval_sec_inner` секунд ПОСЛЕ ТЕКУЩЕГО.
+        # Используем `datetime.now()` внутри функции для максимальной точности.
+        next_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=interval_sec_inner)
+        
+        # Планируем следующую задачу. Передаем свой job.id как prev_job_id для следующей итерации.
         job = scheduler.add_job(
-            send_and_schedule_inner,
+            send_and_schedule,
             'date',
             run_date=next_dt,
-            args=[user_id_inner, msg_inner, interval_inner, next_count, job.id] # Передаем id новой задачи как prev_job_id для будущей итерации
+            args=[user_id_inner, msg_inner, interval_sec_inner, next_count, job.id]
         )
         
-        # Сохраняем ID задачи в словарь пользователя для возможности удаления через /del и /delall
+        # --- КОРРЕКТНОЕ ОБНОВЛЕНИЕ СЛОВАРЯ ДЛЯ /LIST И /DEL ---
         if user_id_inner not in user_reminders:
             user_reminders[user_id_inner] = {}
             
@@ -165,52 +178,52 @@ def add_reminder(update: Update, context: CallbackContext):
         
     # Планируем самую первую задачу. Для нее prev_job_id не нужен (None).
     job_first = scheduler.add_job(
-        send_and_schedule_inner,
+        send_and_schedule,
         'date',
         run_date=first_target_dt,
-        args=[user_id, msg, interval, count]
+        args=[user_id, msg, interval_seconds, count]
     )
     
     # Сохраняем первую задачу в словарь пользователя
     if user_id not in user_reminders:
-        user_reminders[user_id] = {}
-        
+         user_reminders[user_id] = {}
     user_reminders[user_id][job_first.id] = {'msg': msg}
     
-    update.message.reply_text(f"✅ Напоминание добавлено:\n> {msg}\n> Первое в {first_time}")
+    update.message.reply_text(f"✅ Напоминание добавлено:\n> {msg}\n> Первое в {first_time_str}")
+
 
 def list_reminders(update: Update, context: CallbackContext):
     user_id = update.message.chat_id
 
     if not user_reminders.get(user_id):
-        update.message.reply_text("📭 У вас нет активных напоминаний.")
-        return
+         update.message.reply_text("📭 У вас нет активных напоминаний.")
+         return
 
     text = "📝 *Ваши активные напоминания:*"
     
     for i, (job_id, data) in enumerate(user_reminders[user_id].items(), start=1):
-         # Выводим только первые 25 символов сообщения для компактности + ID задачи для /del
          short_msg = (data['msg'][:22] + '...') if len(data['msg']) > 25 else data['msg']
          text += f"\n{i}. `{job_id}` - {short_msg}"
         
     update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+
 def delete_reminder(update: Update, context: CallbackContext):
     user_id = update.message.chat_id
 
     if len(context.args) != 1:
-        update.message.reply_text("⚠️ Используйте формат: /del [ID_напоминания]. ID можно увидеть в команде /list.")
-        return
+         update.message.reply_text("⚠️ Используйте формат: /del [ID_напоминания]. ID можно увидеть в команде /list.")
+         return
 
     job_key = context.args[0]
     
     if not user_reminders.get(user_id) or job_key not in user_reminders[user_id]:
-        update.message.reply_text("❌ Напоминание с таким ID не найдено.")
-        return
+         update.message.reply_text("❌ Напоминание с таким ID не найдено.")
+         return
 
     try:
-        scheduler.remove_job(job_key)
-        
+         scheduler.remove_job(job_key)
+         
          # Удаляем из словаря пользователя
          del user_reminders[user_id][job_key]
          
@@ -223,6 +236,7 @@ def delete_reminder(update: Update, context: CallbackContext):
     except JobLookupError:
          update.message.reply_text("❌ Ошибка при удалении. Напоминание могло уже сработать или быть удалено.")
 
+
 def delete_all(update: Update, context: CallbackContext):
     user_id = update.message.chat_id
 
@@ -230,66 +244,47 @@ def delete_all(update: Update, context: CallbackContext):
          update.message.reply_text("📭 У вас нет активных напоминаний для удаления.")
          return
 
-     # Получаем список ID задач для удаления из планировщика и словаря
      jobs_to_remove = list(user_reminders[user_id].keys())
      
      for job_key in jobs_to_remove:
          try:
              scheduler.remove_job(job_key)
+             del user_reminders[user_id][job_key]
          except JobLookupError:
-             continue # Игнорируем ошибку "задача уже не существует"
+             continue 
      
      del user_reminders[user_id]
      update.message.reply_text("🗑️ Все напоминания удалены.")
 
+
 def error_handler(update: object, context: CallbackContext):
      """Логирует ошибки."""
      logger.error(msg="Exception while handling an update:", exc_info=context.error)
-     # Также отправим сообщение об ошибке в чат разработчика (если указан)
-     # context.bot.send_message(chat_id=CHAT_ID_DEV, text=f"Error: {context.error}")
      
 # --- ЗАПУСК БОТА ---
 def main():
-     # Получаем токен из переменной окружения (безопасно)
      token = os.environ.get('8605114997:AAG_II-LnXBlABH_M-0IryIjotplhxJab58')
      if not token:
          logger.error("Ошибка: Переменная окружения TELEGRAM_TOKEN не установлена.")
+         print("Пожалуйста, установите переменную окружения TELEGRAM_TOKEN.")
          return
 
      updater = Updater(token)
      dispatcher = updater.dispatcher
 
-     # Регистрация обработчиков команд и сообщений
      dispatcher.add_handler(CommandHandler("start", start))
      dispatcher.add_handler(CommandHandler("help", help_command))
      dispatcher.add_handler(CommandHandler("list", list_reminders))
      dispatcher.add_handler(CommandHandler("del", delete_reminder))
      dispatcher.add_handler(CommandHandler("delall", delete_all))
      
-     # Обработчик для создания напоминаний по тексту сообщения (не команда)
      dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, add_reminder))
      
-     # Регистрируем обработчик ошибок (важно для стабильной работы на хостингах)
      dispatcher.add_error_handler(error_handler)
      
-     # Запуск через Polling (для локального теста) или Webhook (для продакшена)
-     mode = os.environ.get('MODE', 'polling')
-     
      try:
-         if mode == 'webhook':
-             PORT = int(os.environ.get("PORT", 5000))
-             updater.start_webhook(
-                 listen="0.0.0.0",
-                 port=PORT,
-                 url_path=token,
-             )
-             updater.bot.set_webhook(f"https://{os.environ['HEROKU_APP_NAME']}.herokuapp.com/{token}")
-             print("Бот запущен в режиме Webhook.")
-         else:
-             updater.start_polling()
-             print("Бот запущен в режиме Polling.")
-         
-         updater.idle()
+         updater.start_polling()
+         print("Бот запущен в режиме Polling.")
          
      except Exception as e:
          logger.error(f"Фатальная ошибка при запуске бота: {e}")
