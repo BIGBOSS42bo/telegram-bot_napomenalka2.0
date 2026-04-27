@@ -1,118 +1,62 @@
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from apscheduler.schedulers.background import BackgroundScheduler
+import datetime
 import re
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from database import Session, Reminder
-from scheduler import schedule_reminder
-import config
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я бот для напоминаний.\n"
-        "Формат сообщения: [текст],[время],[интервал],[количество]\n"
-        "Пример: Выйти на улицу,3:30,14:40,3\n"
-        "Команды:\n"
-        "/help — справка\n"
-        "/list — список напоминаний\n"
-        "/del [номер] — удалить напоминание\n"
-        "/delall — удалить все напоминания"
-    )
+# Словарь для хранения напоминаний: user_id -> список напоминаний
+reminders = {}
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Формат: [текст],[время],[интервал],[количество]\n"
-        "Время — в формате ЧЧ:ММ (например, 3:30)\n"
-        "Интервал — через сколько повторить (0 — не повторять)\n"
-        "Количество — сколько раз повторить (inf — бесконечно)\n\n"
-        "Команды:\n"
-        "/list — показать напоминания\n"
-        "/del [номер] — удалить конкретное\n"
-        "/delall — удалить все"
-    )
-
-def parse_time(time_str):
-    """Парсит время в формате ЧЧ:ММ и возвращает секунды"""
-    try:
-        hours, minutes = map(int, time_str.split(':'))
-        return hours * 3600 + minutes * 60
-    except:
+def parse_reminder(text):
+    match = re.match(r'(.+),(\d{1,2}:\d{2}),(\d{1,2}:\d{2}|0),(\d+|inf)', text)
+    if not match:
         return None
+    msg, first_time, interval, count = match.groups()
+    return msg, first_time, interval, count
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if ',' not in text:
-        await update.message.reply_text("Неверный формат. Используйте: [текст],[время],[интервал],[количество]")
-        return
-    
-    parts = text.split(',')
-    if len(parts) != 4:
-        await update.message.reply_text("Должно быть 4 параметра через запятую")
-        return
-    
-    message, time_str, interval_str, count_str = parts
-    
-    # Парсим время
-    first_delay = parse_time(time_str)
-    if first_delay is None:
-        await update.message.reply_text("Неверный формат времени (должно быть ЧЧ:ММ)")
-        return
-    
-    interval = parse_time(interval_str)
-    if interval is None:
-        await update.message.reply_text("Неверный формат интервала (должно быть ЧЧ:ММ)")
-        return
-    
-    # Обрабатываем количество повторений
-    if count_str.lower() == 'inf':
-        count = -1  # специальное значение для бесконечных напоминаний
-    else:
-        try:
-            count = int(count_str)
-            if count < 0:
-                await update.message.reply_text("Количество должно быть положительным числом или 'inf'")
-                return
-        except:
-            await update.message.reply_text("Количество должно быть числом или 'inf'")
-            return
-    
-    # Сохраняем в БД
-    session = Session()
-    reminder = Reminder(
-        user_id=update.message.from_user.id,
-        message=message.strip(),
-        first_delay=first_delay,
-        interval=interval,
-        count=count,
-        created_at=datetime.now()
-    )
-    session.add(reminder)
-    session.commit()
-    
-    # Планируем напоминание
-    schedule_reminder(context.bot, reminder)
-    
-    await update.message.reply_text(f"Напоминание сохранено! ID: {reminder.id}")
-    session.close()
+def schedule_reminder(user_id, msg, first_time, interval, count):
+    # Преобразование времени в секунды от текущего момента
+    now = datetime.datetime.now()
+    first_dt = datetime.datetime.strptime(first_time, "%H:%M")
+    first_delta = (first_dt - now.time()).total_seconds()
+    if first_delta < 0:
+        first_delta += 86400  # +24 часа
 
-async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = Session()
-    reminders = session.query(Reminder).filter(Reminder.user_id == update.message.from_user.id).all()
-    if not reminders:
-        await update.message.reply_text("У вас нет активных напоминаний")
-        session.close()
-        return
-    
-    response = "Ваши напоминания:\n"
-    for r in reminders:
-        count_text = "бесконечно" if r.count == -1 else r.count
-        response += f"{r.id}. {r.message} (первое через {r.first_delay//3600}ч {(r.first_delay%3600)//60}м, интервал {r.interval//3600}ч {(r.interval%3600)//60}м, повторений: {count_text})\n"
-    
-    await update.message.reply_text(response)
-    session.close()
+    # Планирование первого сообщения
+    scheduler.add_job(send_reminder, 'date', run_date=now + datetime.timedelta(seconds=first_delta),
+                      args=[user_id, msg, interval, count])
 
-async def delete_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Укажите номер напоминания: /del [номер]")
+def send_reminder(user_id, msg, interval, count_left):
+    # Отправка сообщения пользователю
+    updater.bot.send_message(chat_id=user_id, text=msg)
+    if interval != '0' and count_left != '0':
+        # Планирование следующего напоминания
+        h, m = map(int, interval.split(':'))
+        delta = datetime.timedelta(hours=h, minutes=m)
+        new_count = 'inf' if count_left == 'inf' else int(count_left) - 1
+        scheduler.add_job(send_reminder, 'date', run_date=datetime.datetime.now() + delta,
+                          args=[user_id, msg, interval, new_count])
+
+def add_reminder(update, context):
+    user_id = update.message.chat_id
+    parsed = parse_reminder(update.message.text)
+    if not parsed:
+        update.message.reply_text("Неверный формат. Пример: Выйти на улицу,3:30,14:40,3")
         return
-    
-    try:
-        reminder_id = int(context.args[0])
+    msg, first_time, interval, count = parsed
+    schedule_reminder(user_id, msg, first_time, interval, count)
+    update.message.reply_text(f"Напоминание добавлено: {msg}")
+
+# Остальные обработчики команд (/help, /list, /del и т.д.) реализуются аналогично
+
+updater = Updater(token='8605114997:AAG_II-LnXBlABH_M-0IryIjotplhxJab58', use_context=True)
+dispatcher = updater.dispatcher
+
+# Регистрация обработчиков
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, add_reminder))
+# Добавить обработчики для /help, /list, /del [номер], /delall
+
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+updater.start_polling()
+updater.idle()
