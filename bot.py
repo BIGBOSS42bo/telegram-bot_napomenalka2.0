@@ -228,7 +228,7 @@ def error_handler(update: object, context: CallbackContext):
 
 def main():
     # Замените 'ВАШ_ТОКЕН' на токен от @BotFather
-    updater = Updater("ВАШ_ТОКЕН")
+    updater = Updater("8605114997:AAG_II-LnXBlABH_M-0IryIjotplhxJab58")
     
     dispatcher = updater.dispatcher
 
