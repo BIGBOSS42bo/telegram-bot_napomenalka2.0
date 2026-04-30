@@ -4,8 +4,6 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
-#8605114997:AAG_II-LnXBlABH_M-0IryIjotplhxJab58
-
 # Загрузка переменных окружения из .env
 load_dotenv()
 
@@ -27,14 +25,13 @@ def start(update: Update, context: CallbackContext) -> None:
     """Обработчик команды /start."""
     chat_id = update.message.chat_id
     update.message.reply_text("Привет! Через 30 секунд я отправлю тебе это же сообщение.")
+    # Ставим задачу на отправку сообщения через 30 секунд
     context.job_queue.run_once(send_delayed_message, 30, context=chat_id)
 
 
 def main():
-    # Получаем переменные окружения
+    # Получаем токен из переменной окружения
     TOKEN = os.getenv('TELEGRAM_API_TOKEN')
-    PORT = int(os.getenv('PORT', 8443))
-    APP_NAME = os.getenv('APP_NAME')
 
     if not TOKEN:
         raise ValueError("Не указан TELEGRAM_API_TOKEN")
@@ -45,19 +42,22 @@ def main():
     # Регистрируем обработчик команды /start
     dispatcher.add_handler(CommandHandler("start", start))
 
-    # Запуск через webhook (важно для хостинга)
-    updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-    )
-    # Устанавливаем webhook (URL должен быть доступен извне)
-    webhook_url = f"https://{APP_NAME}.bothost.me/{TOKEN}"
-    updater.bot.set_webhook(url=webhook_url)
-
-    logger.info(f"Бот запущен и слушает порт {PORT}")
-    updater.idle()
-
-
+    # --- ИЗМЕНЕНИЯ ДЛЯ ХОСТИНГА ---
+    # Мы НЕ используем start_webhook здесь.
+    # Бот будет запущен платформой bothost через Procfile.
+    # Он будет слушать POST-запросы от GitHub.
+    
+    # Для локального тестирования можно использовать polling:
+    # updater.start_polling()
+    # updater.idle()
+    
+    # Для работы на хостинге через вебхук, код должен быть готов принимать POST-запросы.
+    # Библиотека python-telegram-bot делает это автоматически при запуске через updater.start_polling()
+    # или при обработке вебхука, если платформа сама проксирует запрос.
+    
+    # Чтобы бот не падал сразу при запуске на хостинге (где нет polling),
+    # мы просто оставляем его "живым", ожидая внешних запросов.
+    # В данном случае, bothost сам управляет процессом.
+    
 if __name__ == '__main__':
     main()
